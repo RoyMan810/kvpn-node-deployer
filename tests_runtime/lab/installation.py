@@ -259,6 +259,18 @@ print(json.dumps(out))
             if key_path.stat().st_mode & 0o777 != 0o600 or key_path.stat().st_uid != 0:
                 raise RuntimeError("Runtime credential source is not root-private")
             print("Worker container reached scoped IPC; Backend had neither privilege socket nor runtime credential mount.", flush=True)
+            time_code = """import json
+from hostorbit.runtime.authority import verify_host_time
+from hostorbit.runtime.ipc import Client
+c=json.load(open('/etc/hostorbit/runtime.json'))
+envelope=Client(c['gate_socket'],server_uids={0}).call('time.health',{})
+report=verify_host_time(envelope,open(c['public_verify_key'],'rb').read())
+assert report['type']=='time.health' and report['state'] in ('FRESH','HOLDOVER','UNTRUSTED')
+print('VERIFIED_HOST_TIME')
+"""
+            if docker(args.docker_host, "exec", ids["worker"], "python", "-c", time_code) != "VERIFIED_HOST_TIME":
+                raise RuntimeError("Container Worker could not verify the host TimeHealth signature")
+            print("Networkless Worker verified host TimeHealth through authenticated IPC and the mounted public key.", flush=True)
             with tls_proxy(root) as context:
                 def request(path, body=None):
                     request = Request(ORIGIN + path, data=None if body is None else json.dumps(body).encode(),

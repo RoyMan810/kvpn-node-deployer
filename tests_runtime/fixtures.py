@@ -7,6 +7,8 @@ import tempfile
 import time
 
 from hostorbit.runtime.policy import Policy
+from hostorbit.errors import Denied
+from hostorbit.runtime.timehealth import TimeHealth
 
 
 TARGET = "01JCYQZ4T9V8MNVYEH3D2M7Q1A"
@@ -45,3 +47,30 @@ def binding(p, job_id):
 
 def observation():
     return {"status": "REACHABLE", "source": "restricted_helper", "observed_at": int(time.time()), "boot_id": "12345678-1234-1234-1234-123456789abc"}
+
+
+class TestWatch:
+    def __init__(self):
+        self.event, self.failed = False, False
+
+    def changed(self):
+        if self.failed:
+            raise Denied("TIME_WATCH_UNAVAILABLE")
+        event, self.event = self.event, False
+        return event
+
+    def close(self):
+        pass
+
+
+def trusted_time(directory, wall_clock):
+    """Explicit contract-test injection; no runtime flag accepts these values."""
+    initial = wall_clock()
+    def clock():
+        now = wall_clock()
+        return {"wall_ns": int(now * 1e9), "tick_ns": int((10000 + now - initial) * 1e9),
+                "mono_ns": int((10000 + now - initial) * 1e9), "boot_id": "12345678-1234-1234-1234-123456789abc"}
+    def source():
+        return {"source": "chrony", "last_sync_utc": wall_clock(), "offset_ms": 1, "max_error_ms": 10,
+                "rate_ppm": 500, "measurement_id": str(wall_clock())}
+    return TimeHealth.initialize(directory, source=source, clock=clock, watch=TestWatch())

@@ -5,6 +5,7 @@ import os
 import socket
 import stat
 import struct
+import time
 
 from ..errors import Denied
 from .protocol import MAX_FRAME, canonical, decode, fields
@@ -105,9 +106,18 @@ def handle(connection, handler, identities):
         pass
 
 
-def serve(listener, handler, identities):
+def serve(listener, handler, identities, *, poll=None):
+    next_poll = 0
+    if poll is not None:
+        listener.settimeout(30)
     while True:
-        connection, _ = listener.accept()
+        if poll is not None and time.monotonic() >= next_poll:
+            poll()
+            next_poll = time.monotonic() + 30
+        try:
+            connection, _ = listener.accept()
+        except TimeoutError:
+            continue
         with connection:
             handle(connection, handler, identities)
 

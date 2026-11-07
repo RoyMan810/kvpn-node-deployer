@@ -207,6 +207,7 @@ def compose_document(config, image, port):
         "worker": {**common, "user": f"{config['worker_uid']}:{config['worker_gid']}", "command": ["worker"],
                    "network_mode": "none", "group_add": [str(config[key]) for key in ("app_gid", "broker_rpc_gid", "gate_rpc_gid")],
                    "volumes": [*mounts, bind(CONFIG / "targets.json", CONFIG / "targets.json"),
+                               bind(CONFIG / "gate.pub", CONFIG / "gate.pub"),
                                bind(RUN / "broker", RUN / "broker"), bind(RUN / "supervisor", RUN / "supervisor")]},
     }, "networks": {"api": {"driver": "bridge", "internal": False,
                               "driver_opts": {"com.docker.network.bridge.host_binding_ipv4": "127.0.0.1"}}}}

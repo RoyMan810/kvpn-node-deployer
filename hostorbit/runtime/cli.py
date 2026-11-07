@@ -3,6 +3,7 @@
 import argparse
 from contextlib import contextmanager
 import os
+import json
 from pathlib import Path
 import signal
 import sys
@@ -14,13 +15,14 @@ from ..database import DataAccess, Store
 from ..errors import Denied
 from ..queue import JobQueue
 from ..worker import Worker
-from .authority import Authority
+from .authority import Authority, verify_host_time
 from .broker import Broker
 from .ipc import Client, activated_socket, serve
 from .policy import Policy
 from .protocol import fields, integer, text, decode
 from .storage import new_private_file, process_lock, protected_bytes
 from .vault import Vault
+from .timehealth import TimeHealth
 
 
 @contextmanager
@@ -61,10 +63,15 @@ def configuration(path):
 def run(config, command, *, once=False, listener=None, import_args=None):
     expected = {"supervisor": 0, "initialize-supervisor": 0, "api": config["app_uid"], "worker": config["worker_uid"],
                 "broker": config["broker_uid"], "initialize-broker": config["broker_uid"], "import-key": config["broker_uid"],
-                "register-observations": 0}[command]
+                "register-observations": 0, "initialize-time-health": 0, "time-health": 0}[command]
     if os.geteuid() != expected:
         raise Denied("LOCAL_SERVICE_IDENTITY_INVALID")
     access = DataAccess(config["app_uid"], config["app_gid"])
+    if command == "time-health":
+        envelope = Client(config["gate_socket"], server_uids={0}).call("time.health", {})
+        report = verify_host_time(envelope, protected_bytes(config["public_verify_key"], owner=0, maximum=32))
+        print(json.dumps(report))
+        return
     if command == "api":
         from ..api import create_app
         import uvicorn
@@ -74,6 +81,12 @@ def run(config, command, *, once=False, listener=None, import_args=None):
         uvicorn.run(create_app(settings), host=config.get("api_bind", "127.0.0.1"), port=config["api_port"], proxy_headers=False, access_log=False)
         return
     policy = Policy.load(config["targets"], owner=0)
+    if command == "initialize-time-health":
+        with Authority(config["supervisor_directory"], policy).journal.connect():
+            pass
+        health = TimeHealth.initialize(Path(config["supervisor_directory"]) / "time-health")
+        health.close()
+        return
     if command == "initialize-supervisor":
         authority = Authority.initialize(config["supervisor_directory"], policy)
         new_private_file(config["public_verify_key"], bytes(authority.key.verify_key))
@@ -83,8 +96,11 @@ def run(config, command, *, once=False, listener=None, import_args=None):
         authority = Authority(config["supervisor_directory"], policy)
         identities = {(config["worker_uid"], config["worker_gid"]): "worker", (config["broker_uid"], config["broker_gid"]): "broker", (0, 0): "updater"}
         with process_lock(Path(config["supervisor_directory"]) / "authority.lock"):
-            authority.recover()
-            serve(listener or activated_socket(config["gate_socket"]), authority.dispatch, identities)
+            try:
+                authority.recover()
+                serve(listener or activated_socket(config["gate_socket"]), authority.dispatch, identities, poll=authority.poll_time)
+            finally:
+                authority.close()
         return
     if command == "register-observations":
         queue = JobQueue(Store(config["database"], access=access))
@@ -122,7 +138,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="hostorbit-runtime")
     parser.add_argument("--config", type=Path, required=True)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("initialize-supervisor", "initialize-broker", "register-observations", "supervisor", "broker", "api"):
+    for name in ("initialize-supervisor", "initialize-broker", "initialize-time-health", "time-health",
+                 "register-observations", "supervisor", "broker", "api"):
         commands.add_parser(name)
     worker = commands.add_parser("worker")
     worker.add_argument("--once", action="store_true")

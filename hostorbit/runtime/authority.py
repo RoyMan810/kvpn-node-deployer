@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import sqlite3
 import time
 
 from nacl.exceptions import BadSignatureError
@@ -15,6 +16,7 @@ from ..errors import Denied
 from . import policy as policy_module
 from .protocol import SHA256, ULID, canonical, checksum, fields, integer, text
 from .storage import Journal, new_private_file, protected_bytes
+from .timehealth import ANCHOR_FIELDS, TimeHealth
 
 
 _SCHEMA = """
@@ -36,7 +38,8 @@ def host_binding():
 
 def verify_permit(permit, verify_key, *, now):
     fields(permit, ("claims", "signature"))
-    claims = fields(permit["claims"], (*_BINDING_FIELDS, "v", "authority_id", "epoch", "nonce", "issued_at", "expires_at", "lock_closure_digest", "mutating"))
+    anchored = isinstance(permit["claims"], dict) and permit["claims"].get("mutating") is True
+    claims = fields(permit["claims"], (*_BINDING_FIELDS, "v", "authority_id", "epoch", "nonce", "issued_at", "expires_at", "lock_closure_digest", "mutating", *(("time_anchor",) if anchored else ())))
     if type(claims["v"]) is not int or claims["v"] != 1 or type(claims["mutating"]) is not bool:
         raise Denied("PERMIT_PROTOCOL_INVALID")
     try:
@@ -49,14 +52,27 @@ def verify_permit(permit, verify_key, *, now):
     return claims
 
 
+def verify_host_time(envelope, verify_key, *, kind="time.health"):
+    fields(envelope, ("claims", "signature"))
+    claims = envelope["claims"]
+    if not isinstance(claims, dict) or claims.get("type") != kind or type(claims.get("v")) is not int or claims["v"] != 1:
+        raise Denied("TIME_PROOF_INVALID")
+    try:
+        VerifyKey(verify_key).verify(canonical(claims), base64.b64decode(envelope["signature"], validate=True))
+    except (BadSignatureError, ValueError, TypeError):
+        raise Denied("TIME_PROOF_INVALID") from None
+    return claims
+
+
 class Authority:
-    def __init__(self, directory, policy, *, clock=time.time):
+    def __init__(self, directory, policy, *, clock=time.time, time_health=None):
         self.directory, self.policy, self.clock = Path(directory), policy, clock
         self.journal = Journal(self.directory / "gate.sqlite3")
         self.key = SigningKey(protected_bytes(self.directory / "signing.key", owner=os.geteuid(), maximum=32, exact_mode=0o600))
+        self.time_health = time_health if time_health is not None else TimeHealth(self.directory / "time-health")
 
     @classmethod
-    def initialize(cls, directory, policy, *, clock=time.time):
+    def initialize(cls, directory, policy, *, clock=time.time, time_health=None):
         from ..database import identifier
         directory = Path(directory)
         journal = Journal.initialize(directory / "gate.sqlite3", _SCHEMA)
@@ -65,7 +81,8 @@ class Authority:
         new_private_file(directory / "verify.key", bytes(key.verify_key))
         with journal.write() as db:
             db.execute("INSERT INTO gate VALUES(1,'NORMAL',0,?,?,?,NULL,1)", (policy.digest, identifier(), host_binding()))
-        return cls(directory, policy, clock=clock)
+        time_health = time_health if time_health is not None else TimeHealth.initialize(directory / "time-health")
+        return cls(directory, policy, clock=clock, time_health=time_health)
 
     def _gate(self, db):
         row = db.execute("SELECT * FROM gate WHERE id=1").fetchone()
@@ -85,9 +102,51 @@ class Authority:
                     db.execute("INSERT OR IGNORE INTO incidents VALUES(?,?)", (row["job_id"], canonical(self.policy.closure(row["target"])).decode()))
             hold = gate["state"] != "NORMAL" or any(row["mutating"] for row in active)
             db.execute("UPDATE gate SET epoch=epoch+1,state=? WHERE id=1", ("RECOVERY_HOLD" if hold else "NORMAL",))
+        try:
+            self.time_health.recover()
+        except (OSError, RuntimeError, Denied, ValueError, TypeError, KeyError, sqlite3.Error):
+            pass  # The unavailable time journal cannot authorize mutations.
+
+    def _sign(self, claims):
+        return {"claims": claims, "signature": base64.b64encode(self.key.sign(canonical(claims)).signature).decode()}
+
+    def poll_time(self):
+        report = self.time_health.poll()
+        with self.journal.write() as db:
+            gate = self._gate(db)
+            if report["state"] == "UNTRUSTED" and gate["state"] in ("QUIESCING", "MAINTENANCE", "RESUMING"):
+                db.execute("UPDATE gate SET state='RECOVERY_HOLD',epoch=epoch+1 WHERE id=1")
+        return report
+
+    def time_report(self):
+        report = self.poll_time()
+        with self.journal.connect() as db:
+            gate = self._gate(db)
+            return self._sign({**report, "type": "time.health", "authority_id": gate["instance_id"],
+                               "gate_epoch": gate["epoch"], "gate_state": gate["state"]})
+
+    def time_anchor(self, request):
+        fields(request, ("plan_id", "revision"))
+        with self.journal.connect() as db:
+            gate = self._gate(db)
+            if gate["state"] != "NORMAL" or not gate["activated"]:
+                raise Denied("GATE_CLOSED")
+            instance = gate["instance_id"]
+        anchor = self.time_health.anchor(request["plan_id"], request["revision"])
+        return self._sign({**anchor, "type": "time.anchor", "authority_id": instance})
+
+    def _time_anchor(self, envelope, plan_id, revision, instance_id, *, active=False):
+        claims = verify_host_time(envelope, bytes(self.key.verify_key), kind="time.anchor")
+        fields(claims, (*ANCHOR_FIELDS, "type", "authority_id"))
+        if claims["authority_id"] != instance_id:
+            raise Denied("TIME_PROOF_INVALID")
+        return self.time_health.validate({key: claims[key] for key in ANCHOR_FIELDS}, plan_id, revision, active=active)
 
     def admit(self, request):
-        fields(request, _BINDING_FIELDS)
+        name = request.get("capability") if isinstance(request, dict) else None
+        capability = policy_module.CAPABILITIES.get(name) if isinstance(name, str) else None
+        anchored = capability is not None and capability.mutating
+        fields(request, (*_BINDING_FIELDS, *(("time_anchor",) if anchored else ())))
         for key in ("job_id", "plan_id", "actor_id", "target"):
             text(request[key], ULID)
         text(request["approval_id"], ULID)
@@ -106,6 +165,8 @@ class Authority:
                 raise Denied("REMOTE_PERMIT_HELD")
             if db.execute("SELECT 1 FROM attempts WHERE job_id=?", (request["job_id"],)).fetchone():
                 raise Denied("OPERATION_ALREADY_ADMITTED")
+            if mutating:
+                self._time_anchor(request["time_anchor"], request["plan_id"], request["revision"], gate["instance_id"])
             now = int(self.clock())
             claims = {**request, "v": 1, "authority_id": gate["instance_id"], "epoch": gate["epoch"], "nonce": secrets.token_hex(32),
                       "issued_at": now, "expires_at": now + 60, "lock_closure_digest": checksum(self.policy.closure(target.id)), "mutating": mutating}
@@ -119,6 +180,8 @@ class Authority:
             gate = self._gate(db)
             if claims["epoch"] != gate["epoch"] or (claims["mutating"] and gate["state"] != "NORMAL"):
                 raise Denied("STALE_GATE_EPOCH")
+            if claims["mutating"]:
+                self._time_anchor(claims["time_anchor"], claims["plan_id"], claims["revision"], gate["instance_id"])
             self.policy.target(claims["target"], claims["capability"], claims["scope_digest"])
             changed = db.execute("UPDATE attempts SET state='DISPATCHING' WHERE job_id=? AND nonce=? AND claims=? AND state='ISSUED'",
                                  (claims["job_id"], claims["nonce"], canonical(claims).decode()))
@@ -169,24 +232,28 @@ class Authority:
         return self.status(request["job_id"])
 
     def update(self, operation, request):
+        failed_time = False
         with self.journal.write() as db:
             gate = self._gate(db)
             if operation == "update.quiesce":
-                fields(request, ("kind", "plan_digest", "approval_id"))
+                fields(request, ("kind", "plan_id", "revision", "plan_digest", "approval_id", "time_anchor"))
                 if request["kind"] not in ("application", "self"):
                     raise Denied("RPC_INVALID_REQUEST")
                 text(request["plan_digest"], SHA256)
                 text(request["approval_id"], ULID)
+                text(request["plan_id"], ULID)
+                integer(request["revision"], 1, 2**31 - 1)
                 if not gate["activated"] or gate["state"] != "NORMAL":
                     raise Denied("GATE_CLOSED")
                 if db.execute("SELECT 1 FROM incidents").fetchone():
                     raise Denied("OPEN_INCIDENT")
+                self._time_anchor(request["time_anchor"], request["plan_id"], request["revision"], gate["instance_id"])
                 ticket = {**request, "epoch": gate["epoch"] + 1, "nonce": secrets.token_hex(32)}
                 db.execute("UPDATE gate SET state='QUIESCING',epoch=epoch+1,update_ticket=? WHERE id=1", (canonical(ticket).decode(),))
                 # No SSH send is legal before consumption. Revoking unconsumed permits is provably pre-effect.
                 db.execute("UPDATE attempts SET state='CANCELLED_SAFE',result_code='QUIESCING_BEFORE_DISPATCH' WHERE state='ISSUED'")
                 return ticket
-            fields(request, ("kind", "plan_digest", "approval_id", "epoch", "nonce"))
+            fields(request, ("kind", "plan_id", "revision", "plan_digest", "approval_id", "time_anchor", "epoch", "nonce"))
             transitions = {"update.maintenance": ("QUIESCING", "MAINTENANCE"), "update.resuming": ("MAINTENANCE", "RESUMING"), "update.normal": ("RESUMING", "NORMAL")}
             if operation not in transitions:
                 raise Denied("RPC_OPERATION_DENIED")
@@ -197,10 +264,25 @@ class Authority:
                 raise Denied("OPEN_INCIDENT")
             if db.execute("SELECT 1 FROM attempts WHERE mutating=1 AND state IN ('ISSUED','DISPATCHING','UNKNOWN_OUTCOME')").fetchone():
                 raise Denied("REMOTE_PERMIT_HELD")
-            db.execute("UPDATE gate SET state=?,update_ticket=? WHERE id=1", (after, None if after == "NORMAL" else gate["update_ticket"]))
-            return {"state": after, "epoch": gate["epoch"]}
+            try:
+                self._time_anchor(request["time_anchor"], request["plan_id"], request["revision"], gate["instance_id"],
+                                  active=operation in ("update.resuming", "update.normal"))
+            except Denied:
+                db.execute("UPDATE gate SET state='RECOVERY_HOLD',epoch=epoch+1 WHERE id=1")
+                failed_time = True
+            else:
+                db.execute("UPDATE gate SET state=?,update_ticket=? WHERE id=1", (after, None if after == "NORMAL" else gate["update_ticket"]))
+                result = {"state": after, "epoch": gate["epoch"]}
+        if failed_time:
+            raise Denied("TIME_UNTRUSTED")
+        return result
 
     def dispatch(self, role, peer, operation, payload):
+        if role in ("worker", "broker", "updater") and operation == "time.health":
+            fields(payload, ())
+            return self.time_report()
+        if role in ("worker", "updater") and operation == "time.anchor":
+            return self.time_anchor(payload)
         if role == "worker" and operation == "permit.admit":
             return self.admit(payload)
         if role == "broker" and operation == "permit.consume":
@@ -215,3 +297,6 @@ class Authority:
         if role == "updater" and isinstance(operation, str) and operation.startswith("update."):
             return self.update(operation, payload)
         raise Denied("RPC_OPERATION_DENIED")
+
+    def close(self):
+        self.time_health.close()
